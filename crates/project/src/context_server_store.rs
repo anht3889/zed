@@ -81,6 +81,7 @@ enum ContextServerState {
     Running {
         server: Arc<ContextServer>,
         configuration: Arc<ContextServerConfiguration>,
+        oauth_token_provider: Option<Arc<dyn oauth::OAuthTokenProvider>>,
     },
     Stopped {
         server: Arc<ContextServer>,
@@ -406,7 +407,7 @@ impl ContextServerStore {
             },
             remote: false,
         });
-        self.run_server(server, configuration, cx);
+        self.run_server(server, configuration, None, cx);
     }
 
     fn new_internal(
@@ -500,6 +501,19 @@ impl ContextServerStore {
         self.servers.get(id).map(|state| state.configuration())
     }
 
+    pub fn oauth_token_provider_for_server(
+        &self,
+        id: &ContextServerId,
+    ) -> Option<Arc<dyn oauth::OAuthTokenProvider>> {
+        match self.servers.get(id) {
+            Some(ContextServerState::Running {
+                oauth_token_provider,
+                ..
+            }) => oauth_token_provider.clone(),
+            _ => None,
+        }
+    }
+
     /// Returns a sorted slice of available unique context server IDs. Within the
     /// slice, context servers which have `mcp-server-` as a prefix in their ID will
     /// appear after servers that do not have this prefix in their ID.
@@ -583,7 +597,7 @@ impl ContextServerStore {
             .context("Failed to create context server configuration")?;
 
             this.update(cx, |this, cx| {
-                this.run_server(server, Arc::new(configuration), cx)
+                this.run_server(server, Arc::new(configuration), None, cx)
             });
             Ok(())
         })
@@ -627,6 +641,7 @@ impl ContextServerStore {
         &mut self,
         server: Arc<ContextServer>,
         configuration: Arc<ContextServerConfiguration>,
+        oauth_token_provider: Option<Arc<dyn oauth::OAuthTokenProvider>>,
         cx: &mut Context<Self>,
     ) {
         let id = server.id();
@@ -644,6 +659,7 @@ impl ContextServerStore {
             let id = server.id();
             let server = server.clone();
             let configuration = configuration.clone();
+            let oauth_token_provider = oauth_token_provider.clone();
 
             async move |this, cx| {
                 let new_state = match server.clone().start(cx).await {
@@ -652,6 +668,7 @@ impl ContextServerStore {
                         ContextServerState::Running {
                             server,
                             configuration,
+                            oauth_token_provider,
                         }
                     }
                     Err(err) => resolve_start_failure(&id, err, server, configuration, cx).await,
@@ -706,7 +723,11 @@ impl ContextServerStore {
         id: ContextServerId,
         configuration: Arc<ContextServerConfiguration>,
         cx: &mut AsyncApp,
-    ) -> Result<(Arc<ContextServer>, Arc<ContextServerConfiguration>)> {
+    ) -> Result<(
+        Arc<ContextServer>,
+        Arc<ContextServerConfiguration>,
+        Option<Arc<dyn oauth::OAuthTokenProvider>>,
+    )> {
         let remote = configuration.remote();
         let needs_remote_command = match configuration.as_ref() {
             ContextServerConfiguration::Custom { .. }
@@ -789,7 +810,7 @@ impl ContextServerStore {
                 .as_ref()
                 .map(|factory| factory(id.clone(), configuration.clone()))
         })? {
-            return Ok((server, configuration));
+            return Ok((server, configuration, None));
         }
 
         let cached_token_provider: Option<Arc<dyn oauth::OAuthTokenProvider>> =
@@ -871,7 +892,7 @@ impl ContextServerStore {
             }
         })??;
 
-        Ok((server, configuration))
+        Ok((server, configuration, cached_token_provider))
     }
 
     async fn handle_get_context_server_command(
@@ -1165,7 +1186,7 @@ impl ContextServerStore {
         })??;
 
         this.update(cx, |this, cx| {
-            this.run_server(new_server, configuration, cx);
+            this.run_server(new_server, configuration, Some(token_provider), cx);
         })?;
 
         Ok(())
@@ -1380,9 +1401,9 @@ impl ContextServerStore {
 
         for (id, config) in servers_to_start {
             match Self::create_context_server(this.clone(), id.clone(), config, cx).await {
-                Ok((server, config)) => {
+                Ok((server, config, oauth_token_provider)) => {
                     this.update(cx, |this, cx| {
-                        this.run_server(server, config, cx);
+                        this.run_server(server, config, oauth_token_provider, cx);
                     })?;
                 }
                 Err(err) => {

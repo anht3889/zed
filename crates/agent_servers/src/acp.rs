@@ -10,6 +10,7 @@ use agent_client_protocol::{
 use anyhow::anyhow;
 use async_channel;
 use collections::HashMap;
+use context_server::transport::McpHttpProxy;
 use feature_flags::{AcpBetaFeatureFlag, FeatureFlagAppExt as _};
 use futures::channel::mpsc;
 use futures::future::Shared;
@@ -414,6 +415,11 @@ struct SessionConfigResponse {
     config_options: Option<Vec<acp::SessionConfigOption>>,
 }
 
+struct AcpMcpServers {
+    servers: Vec<acp::McpServer>,
+    proxies: Vec<Arc<McpHttpProxy>>,
+}
+
 #[derive(Clone)]
 struct ConfigOptions {
     config_options: Rc<RefCell<Vec<acp::SessionConfigOption>>>,
@@ -438,6 +444,7 @@ pub struct AcpSession {
     models: Option<Rc<RefCell<acp::SessionModelState>>>,
     session_modes: Option<Rc<RefCell<acp::SessionModeState>>>,
     config_options: Option<ConfigOptions>,
+    _mcp_http_proxies: Vec<Arc<McpHttpProxy>>,
     ref_count: usize,
 }
 
@@ -944,6 +951,7 @@ impl AcpConnection {
         project: Entity<Project>,
         work_dirs: PathList,
         title: Option<SharedString>,
+        mcp_http_proxies: Vec<Arc<McpHttpProxy>>,
         rpc_call: impl FnOnce(
             ConnectionTo<Agent>,
             acp::SessionId,
@@ -1013,6 +1021,7 @@ impl AcpConnection {
                             session_modes: None,
                             models: None,
                             config_options: None,
+                            _mcp_http_proxies: mcp_http_proxies,
                             ref_count: 1,
                         },
                     );
@@ -1271,12 +1280,16 @@ impl AgentConnection for AcpConnection {
             return Task::ready(Err(anyhow!("Working directory cannot be empty")));
         };
         let name = self.id.0.clone();
-        let mcp_servers = mcp_servers_for_project(&project, cx);
+        let AcpMcpServers {
+            servers: mcp_servers,
+            proxies: mcp_http_proxies,
+        } = mcp_servers_for_project(&project, cx);
 
         cx.spawn(async move |cx| {
             let response = into_foreground_future(
-                self.connection
-                    .send_request(acp::NewSessionRequest::new(cwd.clone()).mcp_servers(mcp_servers)),
+                self.connection.send_request(
+                    acp::NewSessionRequest::new(cwd.clone()).mcp_servers(mcp_servers),
+                ),
             )
             .await
             .map_err(map_acp_error)?;
@@ -1412,6 +1425,7 @@ impl AgentConnection for AcpConnection {
                     session_modes: modes,
                     models,
                     config_options: config_options.map(ConfigOptions::new),
+                    _mcp_http_proxies: mcp_http_proxies,
                     ref_count: 1,
                 },
             );
@@ -1445,12 +1459,16 @@ impl AgentConnection for AcpConnection {
             ))));
         }
 
-        let mcp_servers = mcp_servers_for_project(&project, cx);
+        let AcpMcpServers {
+            servers: mcp_servers,
+            proxies: mcp_http_proxies,
+        } = mcp_servers_for_project(&project, cx);
         self.open_or_create_session(
             session_id,
             project,
             work_dirs,
             title,
+            mcp_http_proxies,
             move |connection, session_id, cwd| {
                 Box::pin(async move {
                     let response = into_foreground_future(
@@ -1491,12 +1509,16 @@ impl AgentConnection for AcpConnection {
             ))));
         }
 
-        let mcp_servers = mcp_servers_for_project(&project, cx);
+        let AcpMcpServers {
+            servers: mcp_servers,
+            proxies: mcp_http_proxies,
+        } = mcp_servers_for_project(&project, cx);
         self.open_or_create_session(
             session_id,
             project,
             work_dirs,
             title,
+            mcp_http_proxies,
             move |connection, session_id, cwd| {
                 Box::pin(async move {
                     let response = into_foreground_future(
@@ -2937,25 +2959,29 @@ mod tests {
     }
 }
 
-fn mcp_servers_for_project(project: &Entity<Project>, cx: &App) -> Vec<acp::McpServer> {
+fn mcp_servers_for_project(project: &Entity<Project>, cx: &App) -> AcpMcpServers {
     let context_server_store = project.read(cx).context_server_store().read(cx);
     let is_local = project.read(cx).is_local();
-    context_server_store
-        .configured_server_ids()
-        .iter()
-        .filter_map(|id| {
-            let configuration = context_server_store.configuration_for_server(id)?;
-            match &*configuration {
-                project::context_server_store::ContextServerConfiguration::Custom {
-                    command,
-                    remote,
-                    ..
-                }
-                | project::context_server_store::ContextServerConfiguration::Extension {
-                    command,
-                    remote,
-                    ..
-                } if is_local || *remote => Some(acp::McpServer::Stdio(
+    let mut servers = Vec::new();
+    let mut proxies = Vec::new();
+
+    for id in context_server_store.configured_server_ids() {
+        let Some(configuration) = context_server_store.configuration_for_server(&id) else {
+            continue;
+        };
+
+        match &*configuration {
+            project::context_server_store::ContextServerConfiguration::Custom {
+                command,
+                remote,
+                ..
+            }
+            | project::context_server_store::ContextServerConfiguration::Extension {
+                command,
+                remote,
+                ..
+            } if is_local || *remote => {
+                servers.push(acp::McpServer::Stdio(
                     acp::McpServerStdio::new(id.0.to_string(), &command.path)
                         .args(command.args.clone())
                         .env(if let Some(env) = command.env.as_ref() {
@@ -2965,23 +2991,52 @@ fn mcp_servers_for_project(project: &Entity<Project>, cx: &App) -> Vec<acp::McpS
                         } else {
                             vec![]
                         }),
-                )),
-                project::context_server_store::ContextServerConfiguration::Http {
-                    url,
-                    headers,
-                    timeout: _,
-                } => Some(acp::McpServer::Http(
+                ));
+            }
+            project::context_server_store::ContextServerConfiguration::Http {
+                url,
+                headers,
+                timeout: _,
+            } => {
+                if is_local
+                    && let Some(token_provider) =
+                        context_server_store.oauth_token_provider_for_server(&id)
+                {
+                    match McpHttpProxy::start(
+                        cx.http_client(),
+                        url.clone(),
+                        headers.clone(),
+                        token_provider,
+                    ) {
+                        Ok(proxy) => {
+                            let proxy = Arc::new(proxy);
+                            servers.push(acp::McpServer::Http(acp::McpServerHttp::new(
+                                id.0.to_string(),
+                                proxy.local_url().to_string(),
+                            )));
+                            proxies.push(proxy);
+                            continue;
+                        }
+                        Err(err) => {
+                            log::warn!("failed to start OAuth MCP proxy for {id}: {err:#}");
+                        }
+                    }
+                }
+
+                servers.push(acp::McpServer::Http(
                     acp::McpServerHttp::new(id.0.to_string(), url.to_string()).headers(
                         headers
                             .iter()
                             .map(|(name, value)| acp::HttpHeader::new(name, value))
                             .collect(),
                     ),
-                )),
-                _ => None,
+                ));
             }
-        })
-        .collect()
+            _ => {}
+        }
+    }
+
+    AcpMcpServers { servers, proxies }
 }
 
 fn config_state(
