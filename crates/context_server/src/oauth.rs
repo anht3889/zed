@@ -676,7 +676,7 @@ pub fn dcr_registration_body(redirect_uri: &str) -> serde_json::Value {
     serde_json::json!({
         "client_name": "Zed",
         "redirect_uris": [redirect_uri],
-        "grant_types": ["authorization_code"],
+        "grant_types": ["authorization_code", "refresh_token"],
         "response_types": ["code"],
         "token_endpoint_auth_method": "none"
     })
@@ -1931,7 +1931,10 @@ mod tests {
         let body = dcr_registration_body("http://127.0.0.1:12345/callback");
         assert_eq!(body["client_name"], "Zed");
         assert_eq!(body["redirect_uris"][0], "http://127.0.0.1:12345/callback");
-        assert_eq!(body["grant_types"][0], "authorization_code");
+        assert_eq!(
+            body["grant_types"],
+            serde_json::json!(["authorization_code", "refresh_token"])
+        );
         assert_eq!(body["response_types"][0], "code");
         assert_eq!(body["token_endpoint_auth_method"], "none");
     }
